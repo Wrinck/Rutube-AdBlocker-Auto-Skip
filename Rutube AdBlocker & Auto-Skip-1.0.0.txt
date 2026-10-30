@@ -1,0 +1,281 @@
+// ==UserScript==
+// @name         Rutube AdBlocker & Auto-Skip
+// @namespace    https://github.com/Wrinck/Rutube-AdBlocker-Auto-Skip
+// @version      1.0.0
+// @description  Полная блокировка и мгновенный автопропуск любой рекламы на Rutube (прероллы, мидроллы, баннеры, паузы, AdFox/Яндекс)
+// @author       Wrinck
+// @match        *://rutube.ru/*
+// @match        *://*.rutube.ru/*
+// @run-at       document-start
+// @grant        unsafeWindow
+// @grant        GM_addStyle
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    const win = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+
+    const AD_URL_PATTERNS = [
+        'an.yandex.ru',
+        'yabs.yandex.ru',
+        'adfox.ru',
+        'rutube.ru/api/adv/',
+        'rutube.ru/api/advertising/',
+        'target.my.com',
+        'vk.com/ads',
+        'tns-counter.ru',
+        'counter.yadro.ru',
+        'top-fwz1.mail.ru',
+        'dsp.yandex',
+        'ad.mail.ru',
+        'hybrid.ai'
+    ];
+
+    function isAdNetworkUrl(url) {
+        if (!url || typeof url !== 'string') return false;
+        return AD_URL_PATTERNS.some(pattern => url.includes(pattern));
+    }
+
+    const AD_KEYS = new Set([
+        'advertising',
+        'advertisement',
+        'advert',
+        'ads',
+        'ad_rolls',
+        'ad_banners',
+        'ad_config',
+        'roll_config',
+        'preroll',
+        'prerolls',
+        'midroll',
+        'midrolls',
+        'postroll',
+        'postrolls',
+        'pauseroll',
+        'pauserolls',
+        'vast',
+        'vast_url',
+        'vmap',
+        'vmap_url',
+        'external_advertising',
+        'yandex_ad',
+        'adfox',
+        'banners'
+    ]);
+
+    function stripAdPayload(obj) {
+        if (!obj || typeof obj !== 'object') return false;
+        let modified = false;
+
+        for (const key of Object.keys(obj)) {
+            const lowerKey = key.toLowerCase();
+            if (AD_KEYS.has(lowerKey) || lowerKey.startsWith('ad_') || lowerKey.includes('advert')) {
+                if (Array.isArray(obj[key])) {
+                    obj[key] = [];
+                } else if (typeof obj[key] === 'object' && obj[key] !== null) {
+                    obj[key] = {};
+                } else {
+                    delete obj[key];
+                }
+                modified = true;
+            } else if (typeof obj[key] === 'object' && obj[key] !== null) {
+                if (stripAdPayload(obj[key])) {
+                    modified = true;
+                }
+            }
+        }
+        return modified;
+    }
+
+    const originalFetch = win.fetch;
+    win.fetch = async function(...args) {
+        const resource = args[0];
+        const url = typeof resource === 'string' ? resource : (resource && resource.url ? resource.url : '');
+
+        if (isAdNetworkUrl(url)) {
+            return new Response(JSON.stringify({}), {
+                status: 200,
+                headers: { 'Content-Type': 'application/json' }
+            });
+        }
+
+        const response = await originalFetch.apply(this, args);
+
+        if (url && (url.includes('/api/play/options') || url.includes('/api/video/'))) {
+            try {
+                const clone = response.clone();
+                const json = await clone.json();
+                if (stripAdPayload(json)) {
+                    return new Response(JSON.stringify(json), {
+                        status: response.status,
+                        statusText: response.statusText,
+                        headers: response.headers
+                    });
+                }
+            } catch (err) {}
+        }
+
+        return response;
+    };
+
+
+    const origOpen = win.XMLHttpRequest.prototype.open;
+    const origSend = win.XMLHttpRequest.prototype.send;
+
+    win.XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+        this._reqUrl = typeof url === 'string' ? url : String(url);
+        return origOpen.apply(this, [method, url, ...rest]);
+    };
+
+    win.XMLHttpRequest.prototype.send = function(...args) {
+        if (this._reqUrl && isAdNetworkUrl(this._reqUrl)) {
+            Object.defineProperty(this, 'status', { writable: true, value: 200 });
+            Object.defineProperty(this, 'responseText', { writable: true, value: '{}' });
+            Object.defineProperty(this, 'response', { writable: true, value: '{}' });
+            Object.defineProperty(this, 'readyState', { writable: true, value: 4 });
+            setTimeout(() => {
+                this.dispatchEvent(new Event('readystatechange'));
+                this.dispatchEvent(new Event('load'));
+                this.dispatchEvent(new Event('loadend'));
+            }, 0);
+            return;
+        }
+
+        if (this._reqUrl && (this._reqUrl.includes('/api/play/options') || this._reqUrl.includes('/api/video/'))) {
+            this.addEventListener('readystatechange', () => {
+                if (this.readyState === 4 && this.status === 200) {
+                    try {
+                        const json = JSON.parse(this.responseText);
+                        if (stripAdPayload(json)) {
+                            const cleaned = JSON.stringify(json);
+                            Object.defineProperty(this, 'responseText', { value: cleaned, writable: true, configurable: true });
+                            Object.defineProperty(this, 'response', { value: cleaned, writable: true, configurable: true });
+                        }
+                    } catch (e) {}
+                }
+            });
+        }
+
+        return origSend.apply(this, args);
+    };
+
+    const SKIP_BUTTON_SELECTORS = [
+        '.ra-skip-button',
+        '[class*="skip-button"]',
+        '[class*="skipButton"]',
+        '[class*="SkipButton"]',
+        'button[class*="skip"]',
+        '[data-testid*="skip"]',
+        '.video-ad-skip-button',
+        '.ytp-ad-skip-button',
+        'button[aria-label*="Пропустить"]'
+    ];
+
+    function tryClickSkip() {
+        for (const sel of SKIP_BUTTON_SELECTORS) {
+            const btns = document.querySelectorAll(sel);
+            for (const btn of btns) {
+                if (btn && btn.offsetParent !== null && !btn.disabled) {
+                    btn.click();
+                    return true;
+                }
+            }
+        }
+
+        const allButtons = document.querySelectorAll('button, div[role="button"], span[role="button"]');
+        for (const btn of allButtons) {
+            const text = (btn.textContent || '').trim().toLowerCase();
+            if (text.includes('пропустить') || text.includes('skip ad') || text.includes('пропустить через 0')) {
+                btn.click();
+                return true;
+            }
+        }
+        return false;
+    }
+
+    function checkAndSkipVideoAds() {
+        tryClickSkip();
+
+        const videos = document.querySelectorAll('video');
+        for (const video of videos) {
+            const container = video.closest('[class*="player"], [class*="video"], body') || video.parentElement;
+
+            const isAdContainer = container && (
+                container.querySelector('[class*="ra-ad"], [class*="advertising"], [class*="ad-ui"], [class*="ad-container"]') !== null ||
+                container.className.toString().includes('ad-') ||
+                container.className.toString().includes('advertising')
+            );
+
+            if (isAdContainer || video.classList.toString().includes('ad') || video.hasAttribute('data-ad')) {
+                video.muted = true;
+                video.playbackRate = 16.0;
+                if (video.duration && isFinite(video.duration) && video.duration > 0) {
+                    video.currentTime = video.duration;
+                }
+                tryClickSkip();
+            }
+        }
+    }
+
+    setInterval(checkAndSkipVideoAds, 150);
+
+    const observer = new MutationObserver(() => {
+        checkAndSkipVideoAds();
+    });
+
+    function initObserver() {
+        if (document.body) {
+            observer.observe(document.body, { childList: true, subtree: true });
+        } else {
+            document.addEventListener('DOMContentLoaded', () => {
+                observer.observe(document.body, { childList: true, subtree: true });
+            });
+        }
+    }
+    initObserver();
+
+    const cssRules = `
+        [class*="BannerWrapper"],
+        [class*="banner-container"],
+        [class*="Banner_root"],
+        [class*="Banner_container"],
+        [class*="AdvertisingWrapper"],
+        [class*="ad-banner"],
+        [class*="ad_banner"],
+        [class*="ad-placeholder"],
+        [id*="adfox"],
+        [id*="yandex_rtb"],
+        div[id^="ya_direct"],
+        div[data-testid*="banner"],
+        div[data-testid*="advertisement"],
+        [class*="ra-ad-container"],
+        [class*="ra-overlay-ad"],
+        [class*="ra-pause-ad"],
+        [class*="video-pause-ad"],
+        [class*="ad-banner-overlay"],
+        [class*="branding-banner"],
+        [class*="video-advertising-banner"] {
+            display: none !important;
+            opacity: 0 !important;
+            visibility: hidden !important;
+            pointer-events: none !important;
+            height: 0 !important;
+            width: 0 !important;
+            min-height: 0 !important;
+            margin: 0 !important;
+            padding: 0 !important;
+        }
+    `;
+
+    if (typeof GM_addStyle !== 'undefined') {
+        GM_addStyle(cssRules);
+    } else {
+        const style = document.createElement('style');
+        style.type = 'text/css';
+        style.appendChild(document.createTextNode(cssRules));
+        (document.head || document.documentElement).appendChild(style);
+    }
+
+    console.log('[Rutube AdBlocker] Запущен: реклама заблокирована.');
+})();
